@@ -7,6 +7,7 @@ import type {DownloadResult} from "~/utils/pool";
 import * as pool from '~/utils/pool';
 import type {DownloadableArticle} from "~/types/types";
 import type {AudioResource, VideoPageInfo} from "~/types/video";
+import {getComment} from "~/apis/index";
 
 
 export function formatTimeStamp(timestamp: number) {
@@ -38,19 +39,31 @@ export function formatItemShowType(type: number) {
  * 使用代理下载资源
  * @param url 资源地址
  * @param proxy 代理地址
+ * @param withCredential
  * @param timeout 超时时间(单位: 秒)，默认 30
  */
-async function downloadAssetWithProxy<T extends Blob | string>(url: string, proxy: string, timeout = 30) {
-    const result = await $fetch<T>(`${proxy}?url=${encodeURIComponent(url)}`, {
+async function downloadAssetWithProxy<T extends Blob | string>(url: string, proxy: string | undefined, withCredential = false, timeout = 30) {
+    const headers: Record<string, string> = {}
+    if (withCredential) {
+        try {
+            const credentials = JSON.parse(window.localStorage.getItem('credentials')!)
+            headers.cookie = `pass_ticket=${credentials.pass_ticket};wap_sid2=${credentials.wap_sid2}`;
+        } catch (e) {}
+    }
+    let targetURL = proxy ? `${proxy}?url=${encodeURIComponent(url)}&headers=${encodeURIComponent(JSON.stringify(headers))}` : url
+    targetURL = targetURL.replace(/^http:\/\//, 'https://')
+    const result = await $fetch<T>(targetURL, {
         retry: 0,
         timeout: timeout * 1000,
     })
 
     // 统计代理下载资源流量
-    if (result instanceof Blob) {
-        pool.pool.incrementTraffic(proxy, result.size)
-    } else {
-        pool.pool.incrementTraffic(proxy, new Blob([result]).size)
+    if (proxy) {
+        if (result instanceof Blob) {
+            pool.pool.incrementTraffic(proxy, result.size)
+        } else {
+            pool.pool.incrementTraffic(proxy, new Blob([result]).size)
+        }
     }
 
     return result
@@ -77,7 +90,7 @@ export async function downloadArticleHTML(articleURL: string, title?: string) {
     const parser = new DOMParser()
 
     const htmlDownloadFn = async (url: string, proxy: string) => {
-        const fullHTML = await downloadAssetWithProxy<string>(url, proxy)
+        const fullHTML = await downloadAssetWithProxy<string>(url, proxy, true)
 
         // 验证是否下载完整
         const document = parser.parseFromString(fullHTML, 'text/html')
@@ -114,7 +127,7 @@ export async function downloadArticleHTMLs(articles: DownloadableArticle[], call
     const results: DownloadableArticle[] = []
 
     const htmlDownloadFn = async (article: DownloadableArticle, proxy: string) => {
-        const fullHTML = await downloadAssetWithProxy<string>(article.url, proxy)
+        const fullHTML = await downloadAssetWithProxy<string>(article.url, proxy, true)
 
         // 验证是否下载完整
         const document = parser.parseFromString(fullHTML, 'text/html')
@@ -158,6 +171,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
     const parser = new DOMParser()
     const document = parser.parseFromString(html, 'text/html')
     const $jsArticleContent = document.querySelector('#js_article')!
+    const $jsArticleBottomBar = document.querySelector('#js_article_bottom_bar')!
 
     // #js_content 默认是不可见的(通过js修改为可见)，需要移除该样式
     $jsArticleContent.querySelector('#js_content')?.removeAttribute('style')
@@ -174,7 +188,148 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
     $jsArticleContent.querySelector('#wx_stream_article_slide_tip')?.remove()
 
 
-    let bodyCls = ''
+    let bodyCls = document.body.className
+
+    // 渲染发布时间
+    function __setPubTime(oriTimestamp: number, dom: HTMLElement) {
+        const dateObj = new Date(oriTimestamp * 1000);
+        const padStart = function padStart(v: number) {
+            return "0".concat(v.toString()).slice(-2);
+        };
+        const year = dateObj.getFullYear().toString();
+        const month = padStart(dateObj.getMonth() + 1);
+        const date = padStart(dateObj.getDate());
+        const hour = padStart(dateObj.getHours());
+        const minute = padStart(dateObj.getMinutes());
+        const timeString = "".concat(hour, ":").concat(minute);
+        const dateString = "".concat(year, "年").concat(month, "月").concat(date, "日");
+        const showDate = "".concat(dateString, " ").concat(timeString);
+
+        if (dom) {
+            dom.innerText = showDate;
+        }
+    }
+    const pubTimeMatchResult = html.match(/var oriCreateTime = '(?<date>\d+)'/)
+    if (pubTimeMatchResult && pubTimeMatchResult.groups && pubTimeMatchResult.groups.date) {
+        __setPubTime(parseInt(pubTimeMatchResult.groups.date), document.getElementById('publish_time')!)
+    }
+
+    // 渲染ip属地
+    function getIpWoridng(ipConfig: any) {
+        let ipWording = '';
+        if (parseInt(ipConfig.countryId, 10) === 156) {
+            ipWording = ipConfig.provinceName;
+        } else if (ipConfig.countryId) {
+            ipWording = ipConfig.countryName;
+        }
+        return ipWording;
+    }
+    const ipWrp = document.getElementById('js_ip_wording_wrp')!
+    const ipWording = document.getElementById('js_ip_wording')!
+    const ipWordingMatchResult = html.match(/window\.ip_wording = (?<data>{\s+countryName: '[^']+',[^}]+})/s)
+    if (ipWordingMatchResult && ipWordingMatchResult.groups && ipWordingMatchResult.groups.data) {
+        const json = ipWordingMatchResult.groups.data
+        eval('window.ip_wording = ' + json)
+        const ipWordingDisplay = getIpWoridng((window as any).ip_wording)
+        if (ipWordingDisplay !== '') {
+            ipWording.innerHTML = ipWordingDisplay;
+            ipWrp.style.display = 'inline-block';
+        }
+    }
+
+    // 渲染 标题已修改
+    function __setTitleModify(isTitleModified: boolean) {
+        const wrp = document.getElementById('js_title_modify_wrp')!
+        const titleModifyNode = document.getElementById('js_title_modify')!
+        if (!wrp) return;
+        if (isTitleModified) {
+            titleModifyNode.innerHTML = '标题已修改';
+            wrp.style.display = 'inline-block';
+        } else {
+            wrp.parentNode?.removeChild(wrp);
+        }
+    }
+    const titleModifiedMatchResult = html.match(/window\.isTitleModified = "(?<data>\d*)" \* 1;/)
+    if (titleModifiedMatchResult && titleModifiedMatchResult.groups && titleModifiedMatchResult.groups.data) {
+        __setTitleModify(titleModifiedMatchResult.groups.data === '1')
+    }
+
+    // 下载留言数据
+    let commentHTML = ''
+    const commentIdMatchResult = html.match(/var comment_id = '(?<comment_id>\d+)' \|\| '0';/)
+    if (commentIdMatchResult && commentIdMatchResult.groups && commentIdMatchResult.groups.comment_id) {
+        const comment_id = commentIdMatchResult.groups.comment_id
+        const commentResponse = await getComment(comment_id)
+        // 抓到了留言数据
+        if (commentResponse) {
+            // 留言总数
+            const totalCount = commentResponse.elected_comment.length + commentResponse.elected_comment.reduce((total, item) => {
+                return total + item.reply_new.reply_total_cnt
+            }, 0)
+
+            commentHTML += '<div style="max-width: 667px;margin: 0 auto;padding: 10px 10px 80px;">'
+            commentHTML += `<p style="font-size: 15px;color: #949494;">留言 ${totalCount}</p>`
+            commentHTML += '<div style="margin-top: -10px;">'
+            commentResponse.elected_comment.forEach((comment) => {
+                commentHTML += '<div style="margin-top: 25px;"><div style="display: flex;">'
+                if ([1, 2].includes(comment.identity_type)) {
+                    commentHTML += `<img src="${comment.logo_url}" style="display: block;width: 30px;height: 30px;border-radius: 50%;margin-right: 8px;" alt="">`
+                } else {
+                    commentHTML += `<img src="${comment.logo_url}" style="display: block;width: 30px;height: 30px;border-radius: 2px;margin-right: 8px;" alt="">`
+                }
+                commentHTML += '<div style="flex: 1;"><p style="display: flex;line-height: 16px;margin-bottom: 5px;">'
+                commentHTML += `<span style="margin-right: 5px;font-size: 15px;color: #949494;">${comment.nick_name}</span>`
+                commentHTML += `<span style="margin-right: 5px;font-size: 12px;color: #b5b5b5;">${comment?.ip_wording?.province_name}</span>`
+                commentHTML += `<span style="font-size: 12px;color: #b5b5b5;">${formatAlbumTime(comment.create_time)}</span>`
+                commentHTML += '<span style="flex: 1;"></span><span style="display: inline-flex;align-items: center;">'
+                commentHTML += `<span class="sns_opr_btn sns_praise_btn" style="font-size: 12px;color: #8b8a8a;">${comment.like_num || ''}</span>`
+                commentHTML += '</span></p>'
+                commentHTML += `<p style="font-size: 15px;color: #333;white-space: pre-line;">${comment.content}</p>`
+                commentHTML += '</div></div>'
+
+                if (comment.reply_new && comment.reply_new.reply_list.length > 0) {
+                    commentHTML += '<div style="padding-left: 38px;">'
+                    comment.reply_new.reply_list.forEach((reply) => {
+                        commentHTML += '<div style="display: flex;margin-top: 15px;">'
+                        if ([1, 2].includes(reply.identity_type)) {
+                            commentHTML += `<img src="${reply.logo_url}" style="display: block;width: 23px;height: 23px;border-radius: 50%;margin-right: 8px;" alt="">`
+                        } else {
+                            commentHTML += `<img src="${reply.logo_url}" style="display: block;width: 23px;height: 23px;border-radius: 2px;margin-right: 8px;" alt="">`
+                        }
+                        commentHTML += '<div style="flex: 1;"><p style="display: flex;line-height: 16px;margin-bottom: 5px;">'
+                        commentHTML += `<span style="margin-right: 5px;font-size: 15px;color: #949494;">${reply.nick_name}</span>`
+                        commentHTML += `<span style="margin-right: 5px;font-size: 12px;color: #b5b5b5;">${reply?.ip_wording?.province_name}</span>`
+                        commentHTML += `<span style="font-size: 12px;color: #b5b5b5;">${formatAlbumTime(reply.create_time)}</span>`
+                        commentHTML += '<span style="flex: 1;"></span><span style="display: inline-flex;align-items: center; font-size: 12px;color: #b5b5b5;">'
+                        commentHTML += `<span class="sns_opr_btn sns_praise_btn" style="font-size: 12px;color: #8b8a8a;">${reply.reply_like_num || ''}</span>`
+                        commentHTML += '</span></p>'
+                        commentHTML += `<p style="font-size: 15px;color: #333;white-space: pre-line;">${reply.content}</p>`
+                        commentHTML += '</div></div>'
+                    })
+                    commentHTML += '</div>'
+                }
+                if (comment.reply_new.reply_total_cnt - comment.reply_new.reply_list.length > 0) {
+                    commentHTML += '<p style="display: flex;align-items: center; font-size: 14px;color: #a3a0a0;padding-left: 38px;padding-top: 5px;">'
+                    commentHTML += `<span>${comment.reply_new.reply_total_cnt - comment.reply_new.reply_list.length}条回复</span>`
+                    commentHTML += '<img src="https://wxa.wxs.qq.com/images/wxapp/feedback_icon.png" alt="" style="filter: invert(1);width: 10px;height: 6px;margin-left: 5px;">'
+                    commentHTML += '</p>'
+                }
+                commentHTML += '</div>'
+            })
+            commentHTML += '</div></div>'
+        }
+    }
+
+    // 阅读量
+    let readNum = -1
+    const readNumMatchResult = html.match(/var read_num = ['"](?<read_num>\d+)['"] \* 1;/)
+    const readNumNewMatchResult = html.match(/var read_num_new = ['"](?<read_num_new>\d+)['"] \* 1;/)
+    if (readNumNewMatchResult && readNumNewMatchResult.groups && readNumNewMatchResult.groups.read_num_new) {
+        readNum = parseInt(readNumNewMatchResult.groups.read_num_new, 10)
+    } else if (readNumMatchResult && readNumMatchResult.groups && readNumMatchResult.groups.read_num) {
+        readNum = parseInt(readNumMatchResult.groups.read_num, 10)
+    }
+
     const $js_image_desc = $jsArticleContent.querySelector('#js_image_desc')
     // 图片分享消息
     if ($js_image_desc) {
@@ -262,7 +417,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
                 // 下载资源
                 const videoURLMap = new Map<string, string>()
                 const resourceDownloadFn = async (url: string, proxy: string) => {
-                    const videoData = await downloadAssetWithProxy<Blob>(url, proxy, 10)
+                    const videoData = await downloadAssetWithProxy<Blob>(url, proxy, false,10)
                     const uuid = new Date().getTime() + Math.random().toString()
                     const ext = mime.getExtension(videoData.type)
                     zip.file(`assets/${uuid}.${ext}`, videoData)
@@ -276,7 +431,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
                         urls.push(poster)
                     }
                     urls.push(videoUrl)
-                    return await pool.downloads<string>(urls, resourceDownloadFn)
+                    return await pool.downloads<string>(urls, resourceDownloadFn, false)
                 })
 
                 const div = document.createElement('div')
@@ -287,75 +442,11 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
         }
     }
 
-    // 渲染发布时间
-    function __setPubTime(oriTimestamp: number, dom: HTMLElement) {
-        const dateObj = new Date(oriTimestamp * 1000);
-        const padStart = function padStart(v: number) {
-            return "0".concat(v.toString()).slice(-2);
-        };
-        const year = dateObj.getFullYear().toString();
-        const month = padStart(dateObj.getMonth() + 1);
-        const date = padStart(dateObj.getDate());
-        const hour = padStart(dateObj.getHours());
-        const minute = padStart(dateObj.getMinutes());
-        const timeString = "".concat(hour, ":").concat(minute);
-        const dateString = "".concat(year, "年").concat(month, "月").concat(date, "日");
-        const showDate = "".concat(dateString, " ").concat(timeString);
-
-        if (dom) {
-            dom.innerText = showDate;
-        }
-    }
-    const pubTimeMatchResult = html.match(/var oriCreateTime = '(?<date>\d+)'/)
-    if (pubTimeMatchResult && pubTimeMatchResult.groups && pubTimeMatchResult.groups.date) {
-        __setPubTime(parseInt(pubTimeMatchResult.groups.date), document.getElementById('publish_time')!)
-    }
-
-    // 渲染ip属地
-    function getIpWoridng(ipConfig: any) {
-        let ipWording = '';
-        if (parseInt(ipConfig.countryId, 10) === 156) {
-            ipWording = ipConfig.provinceName;
-        } else if (ipConfig.countryId) {
-            ipWording = ipConfig.countryName;
-        }
-        return ipWording;
-    }
-    const ipWrp = document.getElementById('js_ip_wording_wrp')!
-    const ipWording = document.getElementById('js_ip_wording')!
-    const ipWordingMatchResult = html.match(/window\.ip_wording = (?<data>{\s+countryName: '[^']+',[^}]+})/s)
-    if (ipWordingMatchResult && ipWordingMatchResult.groups && ipWordingMatchResult.groups.data) {
-        const json = ipWordingMatchResult.groups.data
-        eval('window.ip_wording = ' + json)
-        const ipWordingDisplay = getIpWoridng((window as any).ip_wording)
-        if (ipWordingDisplay !== '') {
-            ipWording.innerHTML = ipWordingDisplay;
-            ipWrp.style.display = 'inline-block';
-        }
-    }
-
-    // 渲染 标题已修改
-    function __setTitleModify(isTitleModified: boolean) {
-        const wrp = document.getElementById('js_title_modify_wrp')!
-        const titleModifyNode = document.getElementById('js_title_modify')!
-        if (!wrp) return;
-        if (isTitleModified) {
-            titleModifyNode.innerHTML = '标题已修改';
-            wrp.style.display = 'inline-block';
-        } else {
-            wrp.parentNode?.removeChild(wrp);
-        }
-    }
-    const titleModifiedMatchResult = html.match(/window\.isTitleModified = "(?<data>\d*)" \* 1;/)
-    if (titleModifiedMatchResult && titleModifiedMatchResult.groups && titleModifiedMatchResult.groups.data) {
-        __setTitleModify(titleModifiedMatchResult.groups.data === '1')
-    }
-
     // 下载内嵌音频
     const mpAudioEls = $jsArticleContent.querySelectorAll<HTMLElement>('mp-common-mpaudio')
     if (mpAudioEls.length > 0) {
         const audioResourceDownloadFn = async (asset: AudioResource, proxy: string) => {
-            const audioData = await downloadAssetWithProxy<Blob>(asset.url, proxy, 10)
+            const audioData = await downloadAssetWithProxy<Blob>(asset.url, proxy, false, 10)
             const uuid = asset.uuid
             const ext = mime.getExtension(audioData.type)
             zip.file(`assets/${uuid}.${ext}`, audioData)
@@ -398,7 +489,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
                 })
             })
 
-            return await pool.downloads<AudioResource>(assets, audioResourceDownloadFn)
+            return await pool.downloads<AudioResource>(assets, audioResourceDownloadFn, false)
         })
     }
 
@@ -417,7 +508,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
         // 下载资源
         const videoURLMap = new Map<string, string>()
         const resourceDownloadFn = async (url: string, proxy: string) => {
-            const videoData = await downloadAssetWithProxy<Blob>(url, proxy, 10)
+            const videoData = await downloadAssetWithProxy<Blob>(url, proxy, false,10)
             const uuid = new Date().getTime() + Math.random().toString()
             const ext = mime.getExtension(videoData.type)
             zip.file(`assets/${uuid}.${ext}`, videoData)
@@ -433,7 +524,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
                     urls.push(videoPageInfo.mp_video_trans_info[0].url)
                 }
             })
-            return await pool.downloads<string>(urls, resourceDownloadFn)
+            return await pool.downloads<string>(urls, resourceDownloadFn, false)
         })
 
         const videoIframes = $jsArticleContent.querySelectorAll('iframe.video_iframe')
@@ -467,7 +558,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
             return 0
         }
 
-        const imgData = await downloadAssetWithProxy<Blob>(url, proxy, 10)
+        const imgData = await downloadAssetWithProxy<Blob>(url, proxy, false, 10)
         const uuid = new Date().getTime() + Math.random().toString()
         const ext = mime.getExtension(imgData.type)
         zip.file(`assets/${uuid}.${ext}`, imgData)
@@ -487,6 +578,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
 
     // 下载背景图片 背景图片无法用选择器选中并修改，因此用正则进行匹配替换
     let pageContentHTML = $jsArticleContent.outerHTML
+    const jsArticleBottomBarHTML = $jsArticleBottomBar?.outerHTML
 
     // 收集所有的背景图片地址
     const bgImageURLs = new Set<string>()
@@ -497,7 +589,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
     if (bgImageURLs.size > 0) {
         // 下载背景图片
         const bgImgDownloadFn = async (url: string, proxy: string) => {
-            const imgData = await downloadAssetWithProxy<Blob>(url, proxy, 10)
+            const imgData = await downloadAssetWithProxy<Blob>(url, proxy, false,10)
             const uuid = new Date().getTime() + Math.random().toString()
             const ext = mime.getExtension(imgData.type)
 
@@ -671,12 +763,19 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
     <title>${title}</title>
     ${localLinks}
     <style>
-        #page-content {
+        #page-content,
+        #js_article_bottom_bar,
+        .__page_content__ {
             max-width: 667px;
             margin: 0 auto;
         }
         img {
             max-width: 100%;
+        }
+        .sns_opr_btn::before {
+            width: 16px;
+            height: 16px;
+            margin-right: 3px;
         }
     </style>
 </head>
@@ -684,6 +783,11 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
 ${customElementTemplate}
 
 ${pageContentHTML}
+${jsArticleBottomBarHTML}
+
+${readNum !== -1 ? '<p class="__page_content__">阅读量 ' + readNum + '</p>' : ''}
+<!-- 评论数据 -->
+${commentHTML}
 </body>
 </html>`
 
